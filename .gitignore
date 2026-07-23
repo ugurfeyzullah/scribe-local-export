@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.DS_Store
+output*/
+scribe_staging/
+cache/
+*.pyc
+*.yjr
+notebook_names.json
+document_names.json

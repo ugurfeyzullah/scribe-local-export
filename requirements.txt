@@ -1,0 +1,9 @@
+PyMuPDF>=1.23
+cairosvg>=2.7
+tqdm>=4.60
+Pillow>=10.0
+lxml>=4.9
+pypdf>=4.0
+pikepdf>=8.0
+flask>=3.0
+pywin32>=306; sys_platform == 'win32'
