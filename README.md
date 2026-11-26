@@ -24,6 +24,18 @@ python server.py
 
 Open http://127.0.0.1:7070 - a local web app (design inherited from the original scribe-library project) with three tabs: **Documents**, **Notebooks**, **Screenshots**. One button syncs the device over USB (with a progress bar); opening a document exports it with your annotations overlaid, and everything can be read in the browser - page-flip book mode and zen mode included - downloaded as PDF, or multi-selected and downloaded as a ZIP. Documents and notebooks can be renamed right in the app (click the title, or the pencil on a list entry); downloads use the new names. Conversions are cached next to the app in `cache/web/` (the Clear Cache button resets it), so documents open instantly after the first time. Nothing leaves your machine.
 
+#### Without the cable: the Cloud tab
+
+Like the Kindle phone apps, the **Cloud** tab reads your Amazon account instead of the device. The Scribe syncs to it over Wi-Fi.
+
+- **Sign in** - pick your store (amazon.de, amazon.com, ...) and click *Sign in to Amazon*. Amazon's own sign-in page opens in a small window; you type your password there. Only the resulting session is kept, in `amazon_session.bin`, encrypted with Windows DPAPI for your Windows account. *Sign out* deletes it.
+- **Notebooks** - every Scribe notebook, read in the app or downloaded as PDF (rendered by Kindle for Web). Notebooks synced over USB also get their real names from here.
+- **Documents** - the list of everything you sent to your Kindle. Amazon does not hand the files themselves to other apps (its own website's download actions answer "not available" for personal documents), so a document opens from the USB-synced copy when there is one, with your handwriting.
+- **Uploading** works without the cable through Send to Kindle (below).
+- Handwriting *on PDFs* is not in Amazon's cloud listing; that still comes over USB.
+
+These are Amazon's unofficial web services (the ones its sites use). They can change without notice; requests are spaced out like a browser's. Protocol details were checked against [kindle-scribe-sync](https://github.com/ata88/kindle-scribe-sync) and [obsidian-kindle-scribe-notes-sync-plugin](https://github.com/k4rnaj1k/obsidian-kindle-scribe-notes-sync-plugin).
+
 #### Uploading documents
 
 The **Upload** button puts documents from your computer on the Kindle, two ways:

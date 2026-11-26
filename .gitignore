@@ -9,3 +9,5 @@ cache/
 notebook_names.json
 document_names.json
 uploads/
+amazon_session.bin
+amazon_session.tmp

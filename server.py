@@ -38,6 +38,7 @@ from pathlib import Path
 from flask import (Flask, abort, jsonify, render_template_string, request,
                    send_file)
 
+import amazon_cloud
 import nbk_to_pdf
 import scribe_annotate
 
@@ -337,6 +338,12 @@ def discover_document_items() -> list[dict]:
     return items
 
 
+def _cloud_notebook_titles() -> dict:
+    """Notebook UUID -> title from the last cloud listing (if signed in)."""
+    return {it["notebook_id"]: it["name"] for it in _cloud_items.values()
+            if it.get("kind") == "cloud_notebook"}
+
+
 def discover_notebook_items() -> list[dict]:
     """Standalone handwritten notebooks in the staging mirror."""
     items: list[dict] = []
@@ -355,7 +362,9 @@ def discover_notebook_items() -> list[dict]:
         except OSError:
             continue
         thumb = _thumbs_dir() / f"{entry.name}.png"
-        custom = names.get(entry.name, "").strip()
+        # A rename in this app wins; otherwise the notebook's real title from
+        # the Amazon account (cloud notebooks share the device's UUIDs).
+        custom = names.get(entry.name, "").strip() or _cloud_notebook_titles().get(entry.name, "")
         items.append({
             "kind": "notebook",
             "id": _stable_id(nbk),
@@ -424,6 +433,8 @@ def all_items() -> list[dict]:
 
 
 def find_item(item_id: str) -> dict | None:
+    if item_id.startswith("cl"):
+        return _cloud_items.get(item_id)
     for item in all_items():
         if item["id"] == item_id:
             return item
@@ -964,6 +975,202 @@ def clear_cache():
     return jsonify({"ok": True})
 
 
+# ── Routes: Amazon cloud (wireless) ──────────────────────────────────────────
+#
+# The Kindle phone apps never talk to the device - they read your Amazon
+# account, which the Scribe syncs to over Wi-Fi. The Cloud tab does the same
+# through amazon_cloud.py: notebooks from Kindle for Web, personal documents
+# from "Manage Your Content and Devices". Sign-in happens in a separate
+# process (a native window with Amazon's own page).
+
+_cloud_lock = threading.Lock()
+_cloud_items: dict = {}      # item id -> item dict (last listing)
+_cloud_login = {"running": False, "error": None}
+CLOUD_LIST_PATH = CACHE_DIR / "cloud_library.json"
+
+
+def _cloud_id(kind: str, key: str) -> str:
+    return "cl" + hashlib.md5(f"{kind}:{key}".encode()).hexdigest()[:10]
+
+
+def _cloud_error(e: Exception):
+    if isinstance(e, amazon_cloud.AuthExpired):
+        return jsonify({"ok": False, "auth": True,
+                        "error": "Your Amazon sign-in has expired - sign in again."}), 401
+    log.exception("Cloud request failed")
+    return jsonify({"ok": False, "error": str(e)}), 502
+
+
+def _cloud_index(lib: dict):
+    _cloud_items.clear()
+    for it in lib.get("documents", []) + lib.get("notebooks", []):
+        _cloud_items[it["id"]] = it
+
+
+def _load_cloud_cache():
+    try:
+        _cloud_index(json.loads(CLOUD_LIST_PATH.read_text(encoding="utf-8")))
+    except (OSError, ValueError):
+        pass
+
+
+@app.route("/api/cloud/status")
+def api_cloud_status():
+    st = amazon_cloud.session_status()
+    st["login_running"] = _cloud_login["running"]
+    st["login_error"] = _cloud_login["error"]
+    st["stores"] = amazon_cloud.STORES
+    return jsonify(st)
+
+
+def _run_cloud_login(store):
+    import subprocess
+    try:
+        out = subprocess.run(
+            [sys.executable, "-X", "utf8", str(APP_DIR / "amazon_cloud.py"),
+             "--login", "--store", store],
+            capture_output=True, text=True, encoding="utf-8", timeout=1200,
+            cwd=str(APP_DIR))
+        msg = {}
+        for line in out.stdout.splitlines():
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                pass
+        if not msg.get("ok"):
+            _cloud_login["error"] = msg.get("error") or "Sign-in did not finish"
+    except Exception as e:
+        _cloud_login["error"] = str(e)
+    finally:
+        _cloud_login["running"] = False
+
+
+@app.route("/api/cloud/login", methods=["POST"])
+def api_cloud_login():
+    store = (request.get_json(silent=True) or {}).get("store", "amazon.com")
+    if store not in amazon_cloud.STORES:
+        return jsonify({"ok": False, "error": f"Unknown store {store}"}), 400
+    if _cloud_login["running"]:
+        return jsonify({"ok": True, "message": "Sign-in window already open"})
+    _cloud_login.update(running=True, error=None)
+    threading.Thread(target=_run_cloud_login, args=(store,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/cloud/logout", methods=["POST"])
+def api_cloud_logout():
+    amazon_cloud.delete_session()
+    _cloud_items.clear()
+    CLOUD_LIST_PATH.unlink(missing_ok=True)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/cloud/library")
+def api_cloud_library():
+    refresh = request.args.get("refresh") == "1"
+    if not refresh and CLOUD_LIST_PATH.exists():
+        lib = json.loads(CLOUD_LIST_PATH.read_text(encoding="utf-8"))
+        _cloud_index(lib)
+        return jsonify({"ok": True, **lib})
+    if not amazon_cloud.load_session():
+        return jsonify({"ok": False, "auth": True, "error": "Not signed in"}), 401
+    try:
+        with _cloud_lock:
+            c = amazon_cloud.AmazonCloud()
+            docs = c.list_documents()
+            notebooks = []
+            nb_error = None
+            try:
+                notebooks = c.list_notebooks()
+            except Exception as e:     # documents still useful on their own
+                nb_error = str(e)
+    except Exception as e:
+        return _cloud_error(e)
+    lib = {
+        "fetched_at": datetime.now().isoformat(),
+        "notebook_error": nb_error,
+        "documents": [{
+            "kind": "cloud_document", "id": _cloud_id("doc", d["asin"]),
+            "asin": d["asin"], "name": d["title"], "format": "DOC",
+            "added": d.get("acquired"), "modified": d.get("acquired"),
+            "has_cover": (CACHE_DIR / _cloud_id("doc", d["asin"]) / "page_0000.jpg").exists(),
+        } for d in docs],
+        "notebooks": [{
+            "kind": "cloud_notebook", "id": _cloud_id("nb", n["id"]),
+            "notebook_id": n["id"], "name": n["title"], "folder": n.get("folder", ""),
+            "format": "Notebook", "modified": n.get("modified"),
+            "has_cover": (CACHE_DIR / _cloud_id("nb", n["id"]) / "page_0000.jpg").exists(),
+        } for n in notebooks],
+    }
+    CLOUD_LIST_PATH.write_text(json.dumps(lib, ensure_ascii=False), encoding="utf-8")
+    _cloud_index(lib)
+    return jsonify({"ok": True, **lib})
+
+
+def _ensure_cloud_notebook_pdf(item: dict) -> Path:
+    """Render a cloud notebook through Kindle for Web into out.pdf (cached
+    until the notebook changes)."""
+    d = CACHE_DIR / item["id"]
+    d.mkdir(parents=True, exist_ok=True)
+    pdf = d / "out.pdf"
+    meta_path = d / "meta.json"
+    stamp = item.get("modified") or ""
+    if pdf.exists() and meta_path.exists():
+        try:
+            if json.loads(meta_path.read_text()).get("stamp") == stamp:
+                return pdf
+        except ValueError:
+            pass
+    with _cloud_lock:
+        c = amazon_cloud.AmazonCloud()
+        _convert_state.update(id=item["id"], message="Downloading notebook pages…")
+        try:
+            pngs = c.render_notebook(
+                item["notebook_id"],
+                progress=lambda i, n: _convert_state.update(
+                    id=item["id"], message=f"Downloading pages… {i}/{n}"))
+        finally:
+            _convert_state.update(id=None, message="")
+    amazon_cloud.pngs_to_pdf(pngs, pdf)
+    meta_path.write_text(json.dumps({"stamp": stamp}))
+    return pdf
+
+
+@app.route("/api/cloud/item/<item_id>")
+def api_cloud_item(item_id):
+    item = _cloud_items.get(item_id)
+    if not item:
+        abort(404)
+    if item["kind"] == "cloud_document":
+        # Amazon's website does not hand out personal-document files (its own
+        # "download" actions answer "not available" for them), so a cloud
+        # document opens from the USB-synced copy when there is one - with
+        # your ink overlaid.
+        local = next((d for d in discover_document_items()
+                      if d["asin"] == item["asin"]), None)
+        if not local:
+            return jsonify({**item, "error":
+                "Amazon doesn't let other apps download your sent documents - "
+                "only your Kindle and Amazon's apps receive the file. Sync the "
+                "Kindle over USB once and this document opens here, with your "
+                "handwriting."}), 409
+        return api_document(local["id"])
+    try:
+        pdf_path = _ensure_cloud_notebook_pdf(item)
+        pages = _pdf_to_page_images(pdf_path, CACHE_DIR / item_id, embedded_ok=True)
+    except amazon_cloud.AuthExpired as e:
+        return _cloud_error(e)
+    except Exception as e:
+        log.exception("Cloud notebook failed")
+        return jsonify({"error": str(e), **item}), 500
+    return jsonify({
+        **item,
+        "pages": [f"/page/{item_id}/{i:04d}" for i in range(len(pages))],
+        "pdf_url": f"/pdf/{item_id}",
+        "fallback_pdf": len(pages) == 0,
+    })
+
+
 # ── Routes: upload ───────────────────────────────────────────────────────────
 #
 # Two ways to put a document on the Kindle:
@@ -1318,12 +1525,13 @@ HTML_UI = r"""<!DOCTYPE html>
   }
   .tab {
     flex: 1;
-    padding: 12px 8px;
+    min-width: 0;
+    padding: 12px 4px;
     text-align: center;
     cursor: pointer;
     font-family: 'DM Mono', monospace;
-    font-size: 0.72rem;
-    letter-spacing: 0.08em;
+    font-size: 0.66rem;
+    letter-spacing: 0.04em;
     text-transform: uppercase;
     color: var(--text-muted);
     border-bottom: 2px solid transparent;
@@ -1877,6 +2085,20 @@ HTML_UI = r"""<!DOCTYPE html>
     color: white;
   }
   .btn-modal:disabled { opacity: 0.5; cursor: not-allowed; }
+  .tab.active[data-tab="cloud"] { border-bottom-color: var(--book-accent); }
+  .cloud-panel { padding: 14px 12px; font-size: 0.8rem; line-height: 1.5; color: var(--text-muted); }
+  .cloud-panel h4 { font-family: 'Playfair Display', serif; color: var(--text); font-size: 1rem; margin-bottom: 6px; }
+  .cloud-panel select { width: 100%; margin: 10px 0; padding: 6px; border-radius: 6px;
+    border: 1px solid var(--paper-border); background: white; font-family: 'DM Mono', monospace; font-size: 0.75rem; }
+  .cloud-panel .btn-modal { width: 100%; }
+  .cloud-bar { display: flex; gap: 6px; align-items: center; padding: 6px 12px 8px;
+    font-family: 'DM Mono', monospace; font-size: 0.65rem; color: var(--text-muted); }
+  .cloud-bar span { flex: 1; }
+  .cloud-bar button { font-family: 'DM Mono', monospace; font-size: 0.65rem; cursor: pointer;
+    border: 1px solid var(--paper-border); background: var(--paper); border-radius: 5px; padding: 3px 7px; }
+  .cloud-section { padding: 8px 12px 2px; font-family: 'DM Mono', monospace; font-size: 0.62rem;
+    text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-muted); }
+  .nb-badge.cloud { background: #e3ecf7; color: #33557f; }
   .upload-methods { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
   .upload-method { display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
     font-size: 0.82rem; line-height: 1.4; }
@@ -2305,6 +2527,9 @@ HTML_UI = r"""<!DOCTYPE html>
       <div class="tab" data-tab="screenshots" onclick="switchTab('screenshots')">
         Screenshots <span class="tab-count" id="count-screenshots">0</span>
       </div>
+      <div class="tab" data-tab="cloud" onclick="switchTab('cloud')" title="Your Amazon account - works without the cable">
+        ☁ Cloud <span class="tab-count" id="count-cloud">0</span>
+      </div>
     </div>
 
     <div class="sidebar-actions">
@@ -2387,6 +2612,8 @@ HTML_UI = r"""<!DOCTYPE html>
 <script>
 // ── State ────────────────────────────────────────────────────────────────────
 let library = { documents: [], notebooks: [], screenshots: [] };
+let cloud = { status: null, documents: [], notebooks: [], error: null, loading: false };
+let _cloudPoll = null;
 let currentTab = 'documents';
 let currentItem = null;
 let currentPage = 0;
@@ -2467,6 +2694,7 @@ async function loadLibrary() {
     document.getElementById('count-notebooks').textContent = library.notebooks.length;
     document.getElementById('count-screenshots').textContent = library.screenshots.length;
     renderList();
+    loadCloud(false);
   } catch(e) {
     document.getElementById('item-list').innerHTML =
       `<div class="empty-state">Failed to load library: ${escHtml(e.message)}</div>`;
@@ -2474,6 +2702,101 @@ async function loadLibrary() {
 }
 
 // ── Tabs & filtering ─────────────────────────────────────────────────────────
+// ── Cloud (Amazon account) ───────────────────────────────────────────────────
+async function loadCloud(refresh) {
+  try {
+    cloud.status = await (await fetch('/api/cloud/status')).json();
+  } catch (e) { return; }
+  if (cloud.status.signed_in && !cloud.status.login_running) {
+    cloud.loading = true;
+    if (currentTab === 'cloud') renderList();
+    try {
+      const r = await fetch('/api/cloud/library' + (refresh ? '?refresh=1' : ''));
+      const d = await r.json();
+      if (d.ok) {
+        cloud.documents = d.documents || [];
+        cloud.notebooks = d.notebooks || [];
+        cloud.error = d.notebook_error ? ('Notebooks: ' + d.notebook_error) : null;
+        cloud.fetched_at = d.fetched_at;
+      } else {
+        cloud.error = d.error;
+        if (d.auth) cloud.status.signed_in = false;
+      }
+    } catch (e) { cloud.error = e.message; }
+    cloud.loading = false;
+  }
+  document.getElementById('count-cloud').textContent =
+    cloud.documents.length + cloud.notebooks.length;
+  if (currentTab === 'cloud') renderList();
+}
+
+async function cloudSignIn() {
+  const store = document.getElementById('cloud-store').value;
+  localStorage.setItem('cloudStore', store);
+  await fetch('/api/cloud/login', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({store}) });
+  cloud.status = Object.assign(cloud.status || {}, {login_running: true, login_error: null});
+  renderList();
+  if (_cloudPoll) clearInterval(_cloudPoll);
+  _cloudPoll = setInterval(async () => {
+    const st = await (await fetch('/api/cloud/status')).json();
+    if (!st.login_running) {
+      clearInterval(_cloudPoll); _cloudPoll = null;
+      cloud.status = st;
+      if (st.signed_in) await loadCloud(true); else renderList();
+    }
+  }, 1500);
+}
+
+async function cloudSignOut() {
+  if (!confirm('Sign out of Amazon? The saved session is deleted from this computer.')) return;
+  await fetch('/api/cloud/logout', { method: 'POST' });
+  cloud = { status: { signed_in: false, stores: cloud.status?.stores }, documents: [], notebooks: [] };
+  document.getElementById('count-cloud').textContent = 0;
+  renderList();
+}
+
+function renderCloudPanel() {
+  const st = cloud.status || {};
+  if (st.login_running) {
+    return `<div class="cloud-panel"><h4>Signing in…</h4>
+      Finish signing in in the Amazon window. Amazon may ask a second time for
+      Kindle for Web (notebooks); that's expected. The window closes by itself.</div>`;
+  }
+  const stores = st.stores || ['amazon.com'];
+  const saved = localStorage.getItem('cloudStore') || 'amazon.com';
+  return `<div class="cloud-panel">
+    <h4>Your Kindle, without the cable</h4>
+    Like the Kindle phone apps, this reads your Amazon account: documents you
+    sent to your Kindle and your Scribe notebooks, synced over Wi-Fi.
+    You sign in on Amazon's own page; only the session is kept on this computer,
+    encrypted for your Windows account.
+    <select id="cloud-store">${stores.map(s =>
+      `<option ${s === saved ? 'selected' : ''}>${s}</option>`).join('')}</select>
+    <button class="btn-modal primary" onclick="cloudSignIn()">Sign in to Amazon</button>
+    ${st.login_error ? `<p class="err" style="color:#b33;margin-top:8px">${escHtml(st.login_error)}</p>` : ''}
+    <p style="margin-top:10px;font-size:0.7rem;opacity:0.75">Uses Amazon's unofficial web
+    services (the ones its own sites use); they can change without notice. Annotated
+    PDFs with your ink still come over USB (Documents tab).</p>
+  </div>`;
+}
+
+function renderCloudList(items) {
+  const st = cloud.status || {};
+  const bar = `<div class="cloud-bar"><span>☁ ${escHtml(st.store || '')}${cloud.loading ? ' · loading…' : ''}</span>
+    <button onclick="loadCloud(true)" title="Fetch the latest list from Amazon">↻ Refresh</button>
+    <button onclick="cloudSignOut()">Sign out</button></div>`;
+  const err = cloud.error ? `<div class="empty-state" style="padding:8px 12px;color:#b33">${escHtml(cloud.error)}</div>` : '';
+  const docs = items.filter(i => i.kind === 'cloud_document');
+  const nbs = items.filter(i => i.kind === 'cloud_notebook');
+  let html = bar + err;
+  if (nbs.length) html += `<div class="cloud-section">Notebooks (${nbs.length})</div>` + nbs.map(renderCard).join('');
+  if (docs.length) html += `<div class="cloud-section">Documents (${docs.length})</div>` + docs.map(renderCard).join('');
+  if (!nbs.length && !docs.length && !cloud.loading)
+    html += `<div class="empty-state">Nothing found in your Amazon library${filterText ? ' for "' + escHtml(filterText) + '"' : ''}.</div>`;
+  return html;
+}
+
 function switchTab(tab) {
   currentTab = tab;
   document.querySelectorAll('.tab').forEach(el => {
@@ -2510,6 +2833,7 @@ function currentItems() {
   let items;
   if (currentTab === 'documents') items = library.documents;
   else if (currentTab === 'notebooks') items = library.notebooks;
+  else if (currentTab === 'cloud') items = [...cloud.notebooks, ...cloud.documents];
   else items = library.screenshots || [];
 
   const t = filterText.toLowerCase();
@@ -2525,6 +2849,12 @@ function currentItems() {
 function renderList() {
   const list = document.getElementById('item-list');
   const items = currentItems();
+
+  if (currentTab === 'cloud') {
+    list.innerHTML = (cloud.status && cloud.status.signed_in && !cloud.status.login_running)
+      ? renderCloudList(items) : renderCloudPanel();
+    return;
+  }
 
   if (!items.length) {
     let all;
@@ -2557,13 +2887,15 @@ function renderCard(it) {
   const badge = renderBadge(it);
   const annMeta = (it.kind === 'document' && it.annotated_pages)
     ? `<span title="annotated pages">${it.annotated_pages} ✏</span>` : '';
-  const size = it.kind === 'screenshot' ? `${it.size_kb}kb` : `${it.size_mb}mb`;
+  const isCloud = it.kind.startsWith('cloud_');
+  const size = it.kind === 'screenshot' ? `${it.size_kb}kb`
+    : (isCloud ? (it.folder ? escHtml(it.folder) : '') : `${it.size_mb}mb`);
   return `
     <div class="nb-card ${isActive?'active':''} ${it.unsupported?'unsupported-card':''}" data-kind="${it.kind}"
          onclick="openItem('${it.id}')">
-      <input type="checkbox" class="sel-box" ${selected.has(it.id)?'checked':''}
-             onclick="toggleSelect(event, '${it.id}')" title="Select for download">
-      ${it.kind !== 'screenshot'
+      ${isCloud ? '' : `<input type="checkbox" class="sel-box" ${selected.has(it.id)?'checked':''}
+             onclick="toggleSelect(event, '${it.id}')" title="Select for download">`}
+      ${it.kind !== 'screenshot' && !isCloud
         ? `<span class="card-rename" title="Rename" onclick="renameItem('${it.id}', event)">✎</span>`
         : ''}
       ${thumbHtml}
@@ -2573,9 +2905,9 @@ function renderCard(it) {
         <div class="nb-meta">
           ${annMeta}
           <span>${size}</span>
-          <span title="${it.kind === 'document'
-            ? (it.added ? 'Added to device' : 'Last modified')
-            : (it.kind === 'notebook' ? 'Last written on' : 'Captured')}">${formatDate(it.added || it.modified)}</span>
+          <span title="${it.kind === 'document' || it.kind === 'cloud_document'
+            ? (it.added ? 'Added' : 'Last modified')
+            : (it.kind.endsWith('notebook') ? 'Last written on' : 'Captured')}">${formatDate(it.added || it.modified)}</span>
         </div>
       </div>
     </div>`;
@@ -2587,6 +2919,11 @@ function renderThumb(it) {
   }
   if (it.kind === 'notebook' && it.has_thumbnail) {
     return `<img class="nb-thumb" src="/thumbnail/${it.id}" alt="">`;
+  }
+  if (it.kind.startsWith('cloud_')) {
+    return it.has_cover
+      ? `<img class="nb-thumb" src="/cover/${it.id}" alt="" onerror="this.style.display='none'">`
+      : `<div class="nb-thumb-placeholder ${it.kind === 'cloud_notebook' ? 'notebook' : 'book'}">☁</div>`;
   }
   if (it.kind === 'document' && it.has_cover) {
     return `<img class="nb-thumb" src="/cover/${it.id}" alt="" onerror="this.style.display='none'">`;
@@ -2611,6 +2948,10 @@ function renderBadge(it) {
   }
   if (it.kind === 'notebook')
     return '<span class="nb-badge scribe">Scribe</span>';
+  if (it.kind === 'cloud_notebook')
+    return '<span class="nb-badge cloud">☁ Notebook</span>';
+  if (it.kind === 'cloud_document')
+    return '<span class="nb-badge cloud">☁ Document</span>';
   return '';
 }
 
@@ -2716,6 +3057,8 @@ async function openItem(id) {
     ...library.documents,
     ...library.notebooks,
     ...(library.screenshots || []),
+    ...cloud.notebooks,
+    ...cloud.documents,
   ];
   const it = allItems.find(i => i.id === id);
   if (!it) return;
@@ -2742,7 +3085,8 @@ async function openItem(id) {
     <div class="page-viewport" style="position:relative">
       <div class="loading-overlay">
         <div class="spinner"></div>
-        <div class="loading-text">${it.kind === 'notebook' ? 'Decoding handwriting…'
+        <div class="loading-text">${it.kind.startsWith('cloud_') ? 'Fetching from Amazon…'
+          : it.kind === 'notebook' ? 'Decoding handwriting…'
           : (it.annotated_pages ? 'Preparing annotated PDF…' : 'Extracting document…')}</div>
         <div class="loading-sub">${it.kind === 'notebook'
           ? 'First open of a notebook takes a few seconds — strokes are being rendered. Cached for next time.'
@@ -2753,8 +3097,8 @@ async function openItem(id) {
     </div>
   `;
 
-  const endpoint = it.kind === 'notebook'
-    ? `/api/notebook/${id}` : `/api/document/${id}`;
+  const endpoint = it.kind.startsWith('cloud_') ? `/api/cloud/item/${id}`
+    : it.kind === 'notebook' ? `/api/notebook/${id}` : `/api/document/${id}`;
 
   // Live conversion progress in the loading overlay
   const progTimer = setInterval(async () => {
@@ -2816,8 +3160,9 @@ function buildPagedReader(it, data) {
   reader.innerHTML = `
     <div class="reader-toolbar">
       <div class="reader-title">
-        <span style="cursor:pointer" title="Click to rename"
-              onclick="renameItem('${it.id}')">${formatName(it)}</span>
+        ${it.kind.startsWith('cloud_') ? `<span>${formatName(it)}</span>`
+          : `<span style="cursor:pointer" title="Click to rename"
+              onclick="renameItem('${it.id}')">${formatName(it)}</span>`}
         <em style="margin-left:8px">· ${totalPages} page${totalPages!==1?'s':''}</em>
         ${it.kind === 'document' && it.annotated_pages
           ? `<span class="annotation-pill ok" title="Pages with handwriting baked into this PDF"><span>✏</span> ${it.annotated_pages} annotated page${it.annotated_pages!==1?'s':''}</span>`
@@ -3222,8 +3567,9 @@ function showPdfFallback(it, data) {
   reader.innerHTML = `
     <div class="reader-toolbar">
       <div class="reader-title">
-        <span style="cursor:pointer" title="Click to rename"
-              onclick="renameItem('${it.id}')">${formatName(it)}</span>
+        ${it.kind.startsWith('cloud_') ? `<span>${formatName(it)}</span>`
+          : `<span style="cursor:pointer" title="Click to rename"
+              onclick="renameItem('${it.id}')">${formatName(it)}</span>`}
         <em style="margin-left:8px">· PDF</em>
         ${it.kind === 'document' && it.annotated_pages
           ? `<span class="annotation-pill ok" title="Pages with handwriting baked into this PDF"><span>✏</span> ${it.annotated_pages} annotated page${it.annotated_pages!==1?'s':''}</span>`
@@ -3601,6 +3947,7 @@ if __name__ == "__main__":
 
     start_device_watcher()
     start_issue_date_filler()
+    _load_cloud_cache()
 
     doc_count = len(discover_document_items())
     nb_count = len(discover_notebook_items())
