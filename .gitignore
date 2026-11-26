@@ -8,3 +8,4 @@ cache/
 *.yjr
 notebook_names.json
 document_names.json
+uploads/

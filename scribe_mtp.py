@@ -50,21 +50,63 @@ def _find_child(folder, name):
     return None
 
 
+def _fname(item):
+    """Real file name of a Shell item, extension included.
+
+    item.Name is the *display* name, which drops the extension when Explorer
+    is set to "hide extensions for known file types" - then '.yjr'/'.kfx'
+    checks fail and copied files are looked for under the wrong path.
+    """
+    try:
+        fn = item.ExtendedProperty('System.FileName')
+    except Exception:
+        fn = None
+    return fn or item.Name
+
+
+def _is_up_to_date(item, local_path):
+    """True if the local copy matches the device file's size and mtime.
+    Unknown device metadata counts as up to date (old behaviour)."""
+    try:
+        size = item.ExtendedProperty('System.Size')
+        mod = item.ExtendedProperty('System.DateModified')
+    except Exception:
+        return True
+    st = os.stat(local_path)
+    if size is not None and int(size) != st.st_size:
+        return False
+    if mod is not None:
+        try:
+            remote_ts = mod.timestamp()
+        except AttributeError:
+            return True
+        if remote_ts - st.st_mtime > 2:
+            return False
+    return True
+
+
 def _copy_item_to(shell, item, dest_dir, timeout=120):
     """Copy a Shell item (file or folder) to a local directory via MTP.
     Returns True on success.
     """
     dest_dir = os.path.abspath(dest_dir)
     os.makedirs(dest_dir, exist_ok=True)
-    dest_path = os.path.join(dest_dir, item.Name)
+    dest_path = os.path.join(dest_dir, _fname(item))
 
-    # Skip if already exists with content
+    # Folders are mirrored file by file, so files that changed on the device
+    # (notebooks keep growing as you write) are refreshed individually.
     if item.IsFolder:
-        if os.path.isdir(dest_path) and os.listdir(dest_path):
+        children = list(item.GetFolder.Items())
+        if not children:
+            os.makedirs(dest_path, exist_ok=True)
             return True
-    else:
-        if os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+        return all([_copy_item_to(shell, c, dest_path, timeout) for c in children])
+
+    # Skip files that are already up to date; replace stale ones.
+    if os.path.isfile(dest_path) and os.path.getsize(dest_path) > 0:
+        if _is_up_to_date(item, dest_path):
             return True
+        os.remove(dest_path)
 
     # Shell CopyHere silently fails when the destination path exceeds
     # Windows MAX_PATH (260 chars) — long document names hit this easily.
@@ -90,7 +132,7 @@ def _copy_item_to(shell, item, dest_dir, timeout=120):
                 return True
         time.sleep(0.5)
 
-    log.warning(f"Timeout waiting for copy of {item.Name}")
+    log.warning(f"Timeout waiting for copy of {_fname(item)}")
     return False
 
 
@@ -104,7 +146,7 @@ def _copy_file_via_short_dir(shell, item, dest_path, timeout=120):
 
     tmpdir = tempfile.mkdtemp(prefix='mtp_')
     try:
-        tmp_path = os.path.join(tmpdir, item.Name)
+        tmp_path = os.path.join(tmpdir, _fname(item))
         tmp_ns = shell.NameSpace(tmpdir)
         if tmp_ns is None:
             log.error(f"Shell.NameSpace returned None for {tmpdir}")
@@ -122,7 +164,7 @@ def _copy_file_via_short_dir(shell, item, dest_path, timeout=120):
                 last_size = size
             time.sleep(0.5)
         else:
-            log.warning(f"Timeout waiting for copy of {item.Name}")
+            log.warning(f"Timeout waiting for copy of {_fname(item)}")
             return False
 
         long_dest = '\\\\?\\' + os.path.abspath(dest_path)
@@ -192,27 +234,27 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
         if depth >= 3:
             return
         for child in folder.GetFolder.Items():
-            if (child.IsFolder and not child.Name.endswith('.sdr')
-                    and child.Name not in skip_dirs):
-                child_rel = f"{rel}/{child.Name}" if rel else child.Name
+            if (child.IsFolder and not _fname(child).endswith('.sdr')
+                    and _fname(child) not in skip_dirs):
+                child_rel = f"{rel}/{_fname(child)}" if rel else _fname(child)
                 yield from _doc_folders(child, child_rel, depth + 1)
 
     doc_items = []
     kfx_by_asin = {}
     for folder, rel in _doc_folders(documents_folder):
         for item in folder.GetFolder.Items():
-            asin_m = ASIN_RE.search(item.Name)
+            asin_m = ASIN_RE.search(_fname(item))
             if not asin_m:
                 continue
             asin = asin_m.group(1)
 
-            if item.IsFolder and item.Name.endswith('.sdr'):
+            if item.IsFolder and _fname(item).endswith('.sdr'):
                 # Check if it has a .yjr file
-                has_yjr = any(c.Name.endswith('.yjr') for c in item.GetFolder.Items())
+                has_yjr = any(_fname(c).endswith('.yjr') for c in item.GetFolder.Items())
                 if not has_yjr:
                     continue
 
-                doc_name = re.sub(r'\.pdf_[A-F0-9]{32}\.sdr$', '', item.Name)
+                doc_name = re.sub(r'\.pdf_[A-F0-9]{32}\.sdr$', '', _fname(item))
                 doc_name = re.sub(r'_[A-F0-9]{32}\.sdr$', '', doc_name)
 
                 if name_filter and name_filter.lower() not in doc_name.lower():
@@ -224,7 +266,7 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
                     'doc_name': doc_name,
                     'rel': rel,
                 })
-            elif not item.IsFolder and item.Name.endswith('.kfx'):
+            elif not item.IsFolder and _fname(item).endswith('.kfx'):
                 kfx_by_asin[(asin, rel)] = item
 
     log.info(f"Found {len(doc_items)} annotated document(s) on device")
@@ -242,7 +284,7 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
         # and can hang whole-folder MTP copies indefinitely.
         sdr_dest = os.path.join(dest, doc['sdr_item'].Name)
         yjr_items = [c for c in doc['sdr_item'].GetFolder.Items()
-                     if c.Name.endswith('.yjr')]
+                     if _fname(c).endswith('.yjr')]
         ok = all(_copy_item_to(shell, yjr, sdr_dest) for yjr in yjr_items)
         if ok and yjr_items:
             synced_asins.add(doc['asin'])
@@ -255,17 +297,26 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
         if kfx:
             _copy_item_to(shell, kfx, dest)
 
+    # Phase 1b: the annotation database. Newer firmware keeps handwritten-note
+    # page anchors here instead of in the .yjr sidecars (see
+    # scribe_annotate.read_annotations). Small, and changes on every edit.
+    if synced_asins:
+        if progress_callback:
+            progress_callback("Copying annotation database", 0, 0)
+        ann_db_copied = _sync_annotation_dbs(shell, internal, staging)
+        log.info(f"Synced {ann_db_copied} annotation database(s)")
+
     # Phase 2: Copy PDOC notebooks for synced documents
     pdoc_copied = 0
     for item in notebooks_folder.GetFolder.Items():
-        if not item.IsFolder or '!!PDOC!!' not in item.Name:
+        if not item.IsFolder or '!!PDOC!!' not in _fname(item):
             continue
-        nb_asin = item.Name.split('!!')[0]
+        nb_asin = _fname(item).split('!!')[0]
         if nb_asin in synced_asins:
             if progress_callback:
                 progress_callback(f"Copying notebook for {nb_asin[:16]}...",
                                   pdoc_copied, len(synced_asins))
-            log.info(f"  Copying PDOC notebook: {item.Name}")
+            log.info(f"  Copying PDOC notebook: {_fname(item)}")
             _copy_item_to(shell, item, str(nb_staging))
             pdoc_copied += 1
 
@@ -274,14 +325,14 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
     if include_standalone_notebooks:
         standalone = [
             item for item in notebooks_folder.GetFolder.Items()
-            if item.IsFolder and UUID_RE.match(item.Name)
+            if item.IsFolder and UUID_RE.match(_fname(item))
         ]
         if name_filter:
             log.info(f"Note: --filter doesn't apply to standalone notebooks (they have UUID names)")
         log.info(f"Syncing {len(standalone)} standalone notebook(s)")
         for i, item in enumerate(standalone):
             if progress_callback:
-                progress_callback(f"Copying notebook {item.Name[:16]}...",
+                progress_callback(f"Copying notebook {_fname(item)[:16]}...",
                                   i, len(standalone))
             _copy_item_to(shell, item, str(nb_staging))
             standalone_copied += 1
@@ -293,7 +344,7 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
             thumb_staging = str(nb_staging / 'thumbnails')
             copied = sum(
                 1 for t in thumbs.GetFolder.Items()
-                if not t.IsFolder and t.Name.lower().endswith('.png')
+                if not t.IsFolder and _fname(t).lower().endswith('.png')
                 and _copy_item_to(shell, t, thumb_staging)
             )
             log.info(f"Synced {copied} notebook thumbnail(s)")
@@ -309,7 +360,7 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
             for item in shots.GetFolder.Items():
                 if item.IsFolder:
                     continue
-                if not item.Name.lower().endswith(('.png', '.jpg', '.jpeg')):
+                if not _fname(item).lower().endswith(('.png', '.jpg', '.jpeg')):
                     continue
                 if _copy_item_to(shell, item, ss_staging):
                     screenshots_copied += 1
@@ -335,6 +386,88 @@ def sync_from_device(staging_dir, name_filter=None, include_standalone_notebooks
     }
 
 
+def _sync_annotation_dbs(shell, internal, staging):
+    """Mirror system/ksdk/.annotations/<account>/ksdk_annotation_v1.db."""
+    system = _find_child(internal.GetFolder, 'system')
+    ksdk = system and _find_child(system.GetFolder, 'ksdk')
+    ann = ksdk and _find_child(ksdk.GetFolder, '.annotations')
+    if not ann:
+        return 0
+    copied = 0
+    for account in ann.GetFolder.Items():
+        if not account.IsFolder:
+            continue
+        dest = staging / 'system' / 'ksdk' / '.annotations' / _fname(account)
+        for f in account.GetFolder.Items():
+            if not f.IsFolder and _fname(f).startswith('ksdk_annotation_v1.db'):
+                if _copy_item_to(shell, f, str(dest)):
+                    copied += 1
+    return copied
+
+
+# Where uploads land on the device. The Kindle indexes everything under
+# documents/; a dedicated subfolder keeps uploads easy to find over USB.
+UPLOAD_FOLDER = 'Uploads'
+UPLOAD_EXTENSIONS = ('.pdf', '.epub', '.txt', '.mobi', '.azw3', '.kfx', '.prc')
+
+
+def upload_to_device(paths, subfolder=UPLOAD_FOLDER, timeout=600):
+    """Copy local files into Internal Storage/documents/<subfolder>/ over MTP.
+
+    Returns a list of {'file': name, 'ok': bool, 'error': str|None}.
+    """
+    shell = _get_shell()
+    scribe, device_name = find_kindle_scribe()
+    if not scribe:
+        raise RuntimeError("No Kindle Scribe found. Is it connected via USB?")
+    internal = _find_child(scribe.GetFolder, 'Internal Storage')
+    documents = internal and _find_child(internal.GetFolder, 'documents')
+    if not documents:
+        raise RuntimeError("Cannot access Internal Storage/documents on the device")
+
+    target = documents
+    if subfolder:
+        target = _find_child(documents.GetFolder, subfolder)
+        if target is None:
+            documents.GetFolder.NewFolder(subfolder)
+            for _ in range(20):
+                target = _find_child(documents.GetFolder, subfolder)
+                if target:
+                    break
+                time.sleep(0.5)
+        if target is None:
+            raise RuntimeError(f"Could not create documents/{subfolder} on the device")
+
+    results = []
+    for p in paths:
+        p = os.path.abspath(p)
+        name = os.path.basename(p)
+        if not os.path.isfile(p):
+            results.append({'file': name, 'ok': False, 'error': 'not found'})
+            continue
+        if not name.lower().endswith(UPLOAD_EXTENSIONS):
+            results.append({'file': name, 'ok': False, 'error': 'unsupported file type'})
+            continue
+        size = os.path.getsize(p)
+        target.GetFolder.CopyHere(p, COPY_FLAGS)
+        # MTP copy is async: wait until the device lists the file at full size.
+        ok = False
+        for _ in range(timeout * 2):
+            item = next((c for c in target.GetFolder.Items() if _fname(c) == name), None)
+            if item is not None:
+                try:
+                    dev_size = item.ExtendedProperty('System.Size')
+                except Exception:
+                    dev_size = None
+                if dev_size is None or int(dev_size) == size:
+                    ok = True
+                    break
+            time.sleep(0.5)
+        results.append({'file': name, 'ok': ok, 'error': None if ok else 'timeout'})
+        log.info(f"Uploaded {name}: {'ok' if ok else 'timeout'}")
+    return results
+
+
 if __name__ == '__main__':
     # Subprocess entry point used by server.py: Shell COM must not run on a
     # background thread of the Flask process (native crashes take the whole
@@ -353,6 +486,8 @@ if __name__ == '__main__':
                         help='Emit JSON progress lines on stdout')
     parser.add_argument('--detect', action='store_true',
                         help='Just report the connected device as JSON and exit')
+    parser.add_argument('--upload', nargs='+', metavar='FILE',
+                        help='Copy files to documents/Uploads on the device and exit')
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
@@ -365,6 +500,15 @@ if __name__ == '__main__':
             device_name = None
         print(json.dumps({'device': device_name}), flush=True)
         sys.exit(0)
+
+    if args.upload:
+        try:
+            results = upload_to_device(args.upload)
+        except Exception as e:
+            print(json.dumps({'error': str(e)}), flush=True)
+            sys.exit(1)
+        print(json.dumps({'uploaded': results}), flush=True)
+        sys.exit(0 if all(r['ok'] for r in results) else 1)
 
     if not args.staging:
         parser.error('--staging is required unless --detect is given')

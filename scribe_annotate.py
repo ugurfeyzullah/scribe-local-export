@@ -106,6 +106,70 @@ def parse_yjr(yjr_path):
     return entries
 
 
+# Newer firmware (seen from Sept 2026) no longer writes handwritten-note
+# anchors into the .yjr sidecar. They live in a per-account SQLite database
+# on Internal Storage instead:
+#   system/ksdk/.annotations/<account>/ksdk_annotation_v1.db
+# table nonsyncable_annotations, one row per ink page:
+#   book_id        '<ASIN>-PDOC-<guid>-0'
+#   dataset        11 (handwritten notes)
+#   start_position {"shortPosition": <KFX pid>, "longPosition": ...}
+#   serialized_payload JSON whose json_metadata holds {"note_id": "c..."}
+ANNOTATION_DB_GLOB = 'system/ksdk/.annotations/*/ksdk_annotation_v1.db'
+HANDWRITTEN_NOTE_DATASET = 11
+
+
+def find_annotation_dbs(start_path):
+    """Annotation databases in the device mirror that contains start_path."""
+    for parent in Path(start_path).resolve().parents:
+        found = sorted(parent.glob(ANNOTATION_DB_GLOB))
+        if found:
+            return found
+    return []
+
+
+def parse_annotation_db(db_path, asin):
+    """(pid_offset, note_id) pairs for one document from the annotation DB."""
+    import sqlite3
+    uri = Path(db_path).resolve().as_uri() + '?mode=ro&immutable=1'
+    entries = []
+    try:
+        with sqlite3.connect(uri, uri=True) as con:
+            rows = con.execute(
+                "SELECT start_position, serialized_payload FROM nonsyncable_annotations "
+                "WHERE book_id LIKE ? AND dataset = ?",
+                (f"{asin}-%", HANDWRITTEN_NOTE_DATASET)).fetchall()
+    except sqlite3.Error as e:
+        log.warning(f"Cannot read annotation DB {db_path}: {e}")
+        return []
+    for start_pos, payload in rows:
+        try:
+            pid = int(json.loads(start_pos)['shortPosition'])
+            meta = json.loads(payload).get('json_metadata') or '{}'
+            note_id = json.loads(meta)['note_id'] if isinstance(meta, str) else meta['note_id']
+        except (ValueError, KeyError, TypeError):
+            continue
+        entries.append((pid, note_id))
+    return entries
+
+
+def read_annotations(yjr_path):
+    """Annotation index of a document: the .yjr sidecar, or, when that is empty
+    (newer firmware), the device's annotation database found in the mirror."""
+    entries = parse_yjr(yjr_path)
+    if entries:
+        return entries
+    asin = extract_asin(Path(yjr_path).parent.name)
+    if not asin:
+        return []
+    for db in find_annotation_dbs(yjr_path):
+        entries = parse_annotation_db(db, asin)
+        if entries:
+            log.debug(f"Using annotation DB {db} for {asin}: {len(entries)} entries")
+            return entries
+    return []
+
+
 # ---------------------------------------------------------------------------
 # PID-to-page mapping
 # ---------------------------------------------------------------------------
@@ -509,10 +573,28 @@ def reconstruct_pdf_from_kfx(kfx_path):
 # Main overlay pipeline
 # ---------------------------------------------------------------------------
 
+def load_page_map(path):
+    """Load a manual note->page map: JSON object {note_id: page_number (1-based)}.
+
+    Used when the device's .yjr sidecar has no annotation index (the notebook
+    still holds the ink, but nothing says which page each ink page belongs
+    to). Keys may be full note IDs or unique suffixes of them; entries whose
+    value is null are skipped.
+    """
+    with open(path, encoding='utf-8') as f:
+        raw = json.load(f)
+    return {k: int(v) for k, v in raw.items()
+            if not k.startswith('_') and v is not None}
+
+
 def overlay_annotations(pdf_path, yjr_path, notebook_dir, output_path,
                         kfx_path=None, cache_path=None,
-                        save_annotations_dir=None, progress_callback=None):
+                        save_annotations_dir=None, progress_callback=None,
+                        page_map=None):
     """Main pipeline: parse .yjr, build PID map, decode notebook, overlay on PDF.
+
+    With page_map ({note_id or unique suffix: 1-based page}), the .yjr and PID
+    map are bypassed and each notebook page is placed on the given page.
 
     Returns list of annotation records for logging.
     """
@@ -520,20 +602,37 @@ def overlay_annotations(pdf_path, yjr_path, notebook_dir, output_path,
     log.info(f"YJR:      {yjr_path}")
     log.info(f"Notebook: {notebook_dir}")
 
-    annotations = parse_yjr(yjr_path)
-    log.info(f"Found {len(annotations)} annotation entries")
-    if not annotations:
-        log.warning("No annotations found in .yjr, copying PDF as-is")
-        shutil.copy2(pdf_path, output_path)
-        return []
+    if page_map:
+        svgs = decode_notebook_to_svgs(notebook_dir)
+        annotations = []
+        for key, page_no in page_map.items():
+            matches = [n for n in svgs if n == key or n.endswith(key)]
+            if len(matches) != 1:
+                log.warning(f"Page map key {key!r} matches {len(matches)} notebook pages, skipping")
+                continue
+            # "PID" = page index; identity boundaries below make pid_to_page a no-op
+            annotations.append((page_no - 1, matches[0]))
+        unmapped = [n for n in svgs if n not in {a[1] for a in annotations}]
+        if unmapped:
+            log.warning(f"{len(unmapped)} notebook page(s) not in page map: {', '.join(unmapped)}")
+        log.info(f"Using manual page map: {len(annotations)} annotation entries")
+        with fitz.open(str(pdf_path)) as d:
+            boundaries = [(i, i) for i in range(len(d))]
+        rotations = {}
+    else:
+        annotations = read_annotations(yjr_path)
+        log.info(f"Found {len(annotations)} annotation entries")
+        if not annotations:
+            log.warning("No annotations found in .yjr, copying PDF as-is")
+            shutil.copy2(pdf_path, output_path)
+            return []
 
-    boundaries, rotations = build_pid_map(kfx_path, cache_path)
-    if boundaries is None:
-        log.error("Cannot proceed without PID map")
-        return []
-    rotations = rotations or {}
-
-    svgs = decode_notebook_to_svgs(notebook_dir)
+        boundaries, rotations = build_pid_map(kfx_path, cache_path)
+        if boundaries is None:
+            log.error("Cannot proceed without PID map")
+            return []
+        rotations = rotations or {}
+        svgs = decode_notebook_to_svgs(notebook_dir)
 
     doc = fitz.open(str(pdf_path))
     total_pages = len(doc)
@@ -967,6 +1066,11 @@ def main():
                         help='Output directory (default: output/).')
     parser.add_argument('--save-annotations', action='store_true',
                         help='Save individual annotation PNGs alongside PDFs.')
+    parser.add_argument('--page-map',
+                        help='JSON file {note_id: page_number} placing each notebook page '
+                             'on a PDF page. Use when the .yjr sidecar carries no annotation '
+                             'index (e.g. it was reset by the device). Requires --filter '
+                             'matching a single document.')
     parser.add_argument('--staging-dir', default='scribe_staging',
                         help=argparse.SUPPRESS)
     parser.add_argument('--quiet', action='store_true',
@@ -1024,6 +1128,15 @@ def main():
             sys.exit(1)
         log.warning("No annotated documents found - continuing with notebooks.")
 
+    page_map = None
+    if args.page_map:
+        if len(docs) != 1:
+            log.error(f"--page-map needs --filter to select exactly one document "
+                      f"(matched {len(docs)}).")
+            sys.exit(1)
+        page_map = load_page_map(args.page_map)
+        log.info(f"Loaded page map with {len(page_map)} entries from {args.page_map}")
+
     output_dir = Path(args.output)
     annotated_dir = output_dir / 'annotated'
     reconstructed_dir = output_dir / 'reconstructed'
@@ -1046,13 +1159,22 @@ def main():
         log.info(f"Processing: {doc['name']}")
         out_path = annotated_dir / f"{doc['name']}.pdf"
 
-        if not parse_yjr(str(doc['yjr'])):
-            log.info("No annotations - skipping")
+        if not page_map and not read_annotations(str(doc['yjr'])):
+            nb = Path(doc['notebook']) / 'nbk'
+            if nb.exists() and nb.stat().st_size > 64 * 1024:
+                log.warning(
+                    f"Neither the .yjr sidecar nor the device annotation database "
+                    f"(system/ksdk/.annotations, synced from the device) has an index "
+                    f"for this document, but the notebook holds {nb.stat().st_size // 1024} KB "
+                    f"of ink. Re-sync with the device connected, or supply --page-map. - skipping")
+            else:
+                log.info("No annotations - skipping")
             continue
 
         # Incremental: skip documents whose export is newer than their
         # annotation sidecar (no new ink since the last run).
-        if out_path.exists() and out_path.stat().st_mtime >= Path(doc['yjr']).stat().st_mtime:
+        if (not page_map and out_path.exists()
+                and out_path.stat().st_mtime >= Path(doc['yjr']).stat().st_mtime):
             log.info("Up to date - skipping (no new annotations since last export)")
             up_to_date += 1
             continue
@@ -1077,7 +1199,7 @@ def main():
             records = overlay_annotations(
                 str(pdf_path), str(doc['yjr']), str(doc['notebook']), str(out_path),
                 kfx_path=doc['kfx_path'], cache_path=doc['cache_path'],
-                save_annotations_dir=ann_dir)
+                save_annotations_dir=ann_dir, page_map=page_map)
             all_records.append((doc['name'], records))
         except Exception as e:
             log.error(f"Failed: {e}")

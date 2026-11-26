@@ -24,6 +24,15 @@ python server.py
 
 Open http://127.0.0.1:7070 - a local web app (design inherited from the original scribe-library project) with three tabs: **Documents**, **Notebooks**, **Screenshots**. One button syncs the device over USB (with a progress bar); opening a document exports it with your annotations overlaid, and everything can be read in the browser - page-flip book mode and zen mode included - downloaded as PDF, or multi-selected and downloaded as a ZIP. Documents and notebooks can be renamed right in the app (click the title, or the pencil on a list entry); downloads use the new names. Conversions are cached next to the app in `cache/web/` (the Clear Cache button resets it), so documents open instantly after the first time. Nothing leaves your machine.
 
+#### Uploading documents
+
+The **Upload** button puts documents from your computer on the Kindle, two ways:
+
+- **Send to Kindle** (recommended) - hands the files to Amazon's [Send to Kindle for PC](https://www.amazon.com/sendtokindle), exactly like Explorer's right-click *Send to Kindle* (it runs the app's `StkSendToHandler.exe <files>`). Pick your device and click Send in its window. Amazon converts the files and delivers them over Wi-Fi, and you can write on PDFs and export them later. This tool never handles your Amazon credentials. The app is found automatically; otherwise pass `--stk-handler "<path>\StkSendToHandler.exe"` or set `STK_HANDLER`.
+- **Copy over USB** - copies PDF/EPUB/TXT straight into `documents/Uploads` on the connected device. Instant and offline; the files stay sideloaded documents.
+
+The same USB copy works from the command line: `python scribe_mtp.py --upload file1.pdf file2.epub`.
+
 ### Command line
 
 For batch exports and scripting:
@@ -71,7 +80,10 @@ Notebook files are named by their internal UUID - Amazon keeps notebook display 
 
 ## Good to know
 
-- Repeat runs are cheap: device sync skips files already copied, page-position maps are cached in `cache/`, and documents without new ink since the last export are skipped.
+- Repeat runs are cheap: device sync skips files already copied and unchanged, page-position maps are cached in `cache/`, and documents without new ink since the last export are skipped.
+- Newer firmware (seen from Sept 2026) no longer writes handwritten-note page anchors into the `.yjr` sidecar. The Kindle keeps them in `system/ksdk/.annotations/<account>/ksdk_annotation_v1.db`, which the sync now copies, and the export falls back to it automatically. Before this, such documents exported with no annotations at all. The same firmware change seems to remove the device's own *Share* button for these documents.
+- Sync re-copies files that changed on the device (size/date), so notebooks you keep writing in stay current.
+- `--page-map map.json` (`{note_id: page}`) places ink pages by hand when no index exists anywhere.
 - Annotations are overlaid as vector strokes - crisp at any zoom, small output files.
 - Only documents sent to the device (send to kindle) or created on it are processed.
 - Documents that were converted to a reflowable text layout (rare; PDFs are unaffected) carry no page content and can't be exported.

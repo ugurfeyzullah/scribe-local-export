@@ -203,7 +203,7 @@ def _stable_id(path: Path) -> str:
     return hashlib.md5(str(Path(path).resolve()).encode()).hexdigest()[:12]
 
 
-# parse_yjr over every document on each /api/library call adds up — cache the
+# read_annotations over every document on each /api/library call adds up — cache the
 # results by (path, mtimes).
 _ann_count_cache: dict = {}
 
@@ -218,7 +218,7 @@ def _annotated_pages(yjr_path: Path, pidmap_path) -> int:
     """
     pidmap = Path(pidmap_path) if pidmap_path else None
     try:
-        mtime = yjr_path.stat().st_mtime
+        mtime = (yjr_path.stat().st_mtime, _annotation_db_mtime(yjr_path))
     except OSError:
         return 0
     pidmap_mtime = 0
@@ -231,7 +231,7 @@ def _annotated_pages(yjr_path: Path, pidmap_path) -> int:
         return cached[1]
 
     try:
-        entries = scribe_annotate.parse_yjr(yjr_path)
+        entries = scribe_annotate.read_annotations(yjr_path)
         count = len(entries)
         if entries and pidmap_mtime:
             data = json.loads(pidmap.read_text())
@@ -245,9 +245,28 @@ def _annotated_pages(yjr_path: Path, pidmap_path) -> int:
     return count
 
 
+def _annotation_db_mtime(yjr: Path) -> float:
+    """Newest mtime of the device annotation database(s) in the mirror —
+    newer firmware keeps the ink page anchors there instead of the .yjr."""
+    return max((p.stat().st_mtime
+                for p in scribe_annotate.find_annotation_dbs(yjr)), default=0)
+
+
+def _notebook_mtime(yjr: Path) -> float:
+    """mtime of the document's ink notebook (changes on every new stroke)."""
+    asin = scribe_annotate.extract_asin(yjr.parent.name)
+    nbk = _notebooks_dir() / f"{asin}!!PDOC!!notebook" / "nbk"
+    try:
+        return nbk.stat().st_mtime
+    except OSError:
+        return 0
+
+
 def _doc_cache_key(yjr: Path, kfx_path) -> str:
-    """Conversion-cache key: changes whenever the sidecar or KFX changes."""
-    parts = [str(yjr.stat().st_mtime)]
+    """Conversion-cache key: changes whenever the sidecar, annotation DB,
+    ink notebook or KFX changes."""
+    parts = [str(yjr.stat().st_mtime), str(_annotation_db_mtime(yjr)),
+             str(_notebook_mtime(yjr))]
     if kfx_path:
         try:
             parts.append(str(Path(kfx_path).stat().st_mtime))
@@ -943,6 +962,162 @@ def clear_cache():
     shutil.rmtree(CACHE_DIR, ignore_errors=True)
     CACHE_DIR.mkdir(exist_ok=True)
     return jsonify({"ok": True})
+
+
+# ── Routes: upload ───────────────────────────────────────────────────────────
+#
+# Two ways to put a document on the Kindle:
+#   "stk" - hand the files to Amazon's Send to Kindle for PC, exactly like
+#           Explorer's right-click "Send to Kindle" does (StkSendToHandler.exe
+#           <files>). The official app uploads them with its own sign-in;
+#           Amazon converts them and they arrive on every chosen device with
+#           full Scribe support (writing on PDFs, export). This app never
+#           touches Amazon credentials.
+#   "usb" - copy the files over USB into documents/Uploads on the device.
+#           Instant and offline, but the file stays a sideloaded document.
+
+UPLOAD_DIR = APP_DIR / "uploads"
+UPLOAD_EXTENSIONS = {".pdf", ".epub", ".txt", ".doc", ".docx", ".rtf", ".htm",
+                     ".html", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".mobi",
+                     ".azw3", ".kfx", ".prc"}
+# USB sideloading only makes sense for formats the device opens natively.
+USB_EXTENSIONS = {".pdf", ".epub", ".txt", ".mobi", ".azw3", ".kfx", ".prc"}
+STK_HANDLER_NAME = "StkSendToHandler.exe"
+_stk_override: dict = {"path": None}
+
+
+def find_stk_handler() -> Path | None:
+    """Locate Send to Kindle for PC's shell hand-off program."""
+    import os
+    candidates = []
+    if _stk_override["path"]:
+        candidates.append(Path(_stk_override["path"]))
+    if os.environ.get("STK_HANDLER"):
+        candidates.append(Path(os.environ["STK_HANDLER"]))
+    try:
+        import winreg
+        # The installer writes an uninstall entry that reveals the install
+        # directory.
+        for root, key in ((winreg.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\SendToKindle"),
+                          (winreg.HKEY_LOCAL_MACHINE,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SendToKindle"),
+                          (winreg.HKEY_CURRENT_USER,
+                           r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\SendToKindle")):
+            try:
+                with winreg.OpenKey(root, key) as k:
+                    for value in ("InstallLocation", "UninstallString", "DisplayIcon"):
+                        try:
+                            v = str(winreg.QueryValueEx(k, value)[0]).strip('"')
+                        except OSError:
+                            continue
+                        p = Path(v)
+                        candidates.append((p if p.is_dir() else p.parent) / STK_HANDLER_NAME)
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),
+                 "D:/Apps", "D:/", "C:/"):
+        if base:
+            candidates.append(Path(base) / "Amazon" / "SendToKindle" / STK_HANDLER_NAME)
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _safe_upload_name(name: str) -> str:
+    """Keep the user's file name (incl. non-ASCII) but strip path parts and
+    characters Windows/MTP reject."""
+    name = Path(name.replace("\\", "/")).name
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    return name or "document"
+
+
+@app.route("/api/upload_targets")
+def api_upload_targets():
+    stk = find_stk_handler()
+    return jsonify({
+        "stk_available": bool(stk),
+        "stk_path": str(stk) if stk else None,
+        "device_connected": bool(_device_state["name"]),
+        "device_name": _device_state["name"],
+        "extensions": sorted(UPLOAD_EXTENSIONS),
+        "usb_extensions": sorted(USB_EXTENSIONS),
+    })
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    import subprocess
+    method = request.form.get("method", "stk")
+    files = request.files.getlist("files")
+    if not files:
+        return jsonify({"ok": False, "error": "No files received"}), 400
+    if method not in ("stk", "usb"):
+        return jsonify({"ok": False, "error": f"Unknown method {method!r}"}), 400
+
+    allowed = USB_EXTENSIONS if method == "usb" else UPLOAD_EXTENSIONS
+    batch_dir = UPLOAD_DIR / (datetime.now().strftime("%Y%m%d-%H%M%S-")
+                              + uuid.uuid4().hex[:6])
+    saved, rejected = [], []
+    for f in files:
+        name = _safe_upload_name(f.filename or "")
+        if Path(name).suffix.lower() not in allowed:
+            rejected.append({"file": name, "ok": False,
+                             "error": "file type not supported for this method"})
+            continue
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        dest = batch_dir / name
+        f.save(str(dest))
+        saved.append(dest)
+    if not saved:
+        return jsonify({"ok": False, "results": rejected,
+                        "error": "None of the files can be sent this way"}), 400
+
+    if method == "stk":
+        handler = find_stk_handler()
+        if not handler:
+            return jsonify({"ok": False, "results": rejected, "error":
+                            "Send to Kindle for PC was not found. Install it from "
+                            "amazon.com/sendtokindle, or start the server with "
+                            "--stk-handler <path to StkSendToHandler.exe>."}), 400
+        # Same hand-off as Explorer's "Send to Kindle" context-menu entry.
+        subprocess.Popen([str(handler)] + [str(p) for p in saved],
+                         cwd=str(handler.parent))
+        results = [{"file": p.name, "ok": True, "error": None} for p in saved]
+        return jsonify({"ok": True, "method": "stk", "results": results + rejected,
+                        "message": "Opened Send to Kindle. Choose your device and "
+                                   "click Send in its window."})
+
+    # USB: Shell COM runs in a subprocess, like the sync (native crashes in
+    # COM must not take the server down); one MTP job at a time.
+    if not _sync_lock.acquire(blocking=False):
+        return jsonify({"ok": False, "error": "A device sync is running - try again "
+                                              "when it has finished."}), 409
+    try:
+        out = subprocess.run(
+            [sys.executable, "-X", "utf8", str(APP_DIR / "scribe_mtp.py"),
+             "--upload"] + [str(p) for p in saved],
+            capture_output=True, text=True, encoding="utf-8",
+            timeout=1800, cwd=str(APP_DIR))
+    except subprocess.TimeoutExpired:
+        return jsonify({"ok": False, "error": "USB copy timed out"}), 504
+    finally:
+        _sync_lock.release()
+    msg = {}
+    for line in out.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+    if "error" in msg:
+        return jsonify({"ok": False, "results": rejected, "error": msg["error"]}), 502
+    results = msg.get("uploaded", [])
+    return jsonify({"ok": bool(results) and all(r["ok"] for r in results),
+                    "method": "usb", "results": results + rejected,
+                    "message": "Copied to documents/Uploads on the Kindle."})
 
 
 # ── HTML UI ──────────────────────────────────────────────────────────────────
@@ -1702,6 +1877,14 @@ HTML_UI = r"""<!DOCTYPE html>
     color: white;
   }
   .btn-modal:disabled { opacity: 0.5; cursor: not-allowed; }
+  .upload-methods { margin-top: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .upload-method { display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+    font-size: 0.82rem; line-height: 1.4; }
+  .upload-method input { margin-top: 3px; }
+  .upload-method small { display: block; color: var(--text-muted); font-size: 0.74rem; }
+  .upload-method.disabled { opacity: 0.5; cursor: not-allowed; }
+  .upload-status .ok { color: #3a7d44; }
+  .upload-status .err { color: #b33; }
   .upload-status {
     margin-top: 16px;
     font-family: 'DM Mono', monospace;
@@ -2092,6 +2275,7 @@ HTML_UI = r"""<!DOCTYPE html>
       Scribe Library
     </div>
     <button class="btn-sync" onclick="syncAll()">⇣ Sync Device</button>
+    <button class="btn-upload" onclick="openUpload()">⇡ Upload</button>
     <button class="btn-icon" onclick="clearCache()">✕ Clear Cache</button>
     <div class="topbar-status">
       <span class="device-dot" id="device-dot"></span>
@@ -2154,6 +2338,37 @@ HTML_UI = r"""<!DOCTYPE html>
     </div>
   </main>
 
+</div>
+
+<!-- Upload dialog -->
+<div class="modal-bg" id="upload-modal" onclick="if (event.target === this) closeUpload()">
+  <div class="modal" role="dialog" aria-labelledby="upload-title">
+    <h3 id="upload-title">Upload to Kindle</h3>
+    <p>Add documents from this computer to your Kindle.</p>
+    <div class="drop-zone" id="drop-zone" onclick="document.getElementById('upload-input').click()">
+      <div class="drop-zone-text" id="drop-zone-text">Drop files here or click to choose</div>
+      <div class="drop-zone-hint">PDF, EPUB, Word, TXT, RTF, HTML, images</div>
+    </div>
+    <input type="file" id="upload-input" multiple style="display:none"
+      onchange="setUploadFiles(this.files)">
+    <div class="upload-methods">
+      <label class="upload-method">
+        <input type="radio" name="upload-method" value="stk" checked onchange="refreshUploadButton()">
+        <span><strong>Send to Kindle</strong> (recommended)
+          <small id="stk-hint">Opens Amazon's Send to Kindle app with these files. Delivered over Wi-Fi to your Kindle, and you can write on the PDFs.</small></span>
+      </label>
+      <label class="upload-method">
+        <input type="radio" name="upload-method" value="usb" onchange="refreshUploadButton()">
+        <span><strong>Copy over USB</strong>
+          <small id="usb-hint">Instant and offline. Copied to documents/Uploads. PDF, EPUB and TXT only; handwriting on sideloaded files may be limited.</small></span>
+      </label>
+    </div>
+    <div class="upload-status" id="upload-status"></div>
+    <div class="modal-actions">
+      <button class="btn-modal" onclick="closeUpload()">Close</button>
+      <button class="btn-modal primary" id="upload-go" onclick="doUpload()" disabled>Upload</button>
+    </div>
+  </div>
 </div>
 
 <!-- Zen mode floating controls (visible only in zen mode, fade with mouse activity) -->
@@ -3064,6 +3279,7 @@ function showScreenshot(it) {
 
 function handleKey(e) {
   if (!currentItem || e.target.tagName === 'INPUT') return;
+  if (document.getElementById('upload-modal').classList.contains('show')) return;
   if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') goPage(-1);
   if (e.key === 'ArrowRight' || e.key === 'ArrowDown') goPage(1);
   if (e.key === '+' || e.key === '=') changeZoom(0.15);
@@ -3135,6 +3351,102 @@ function toggleBookMode() {
 }
 
 // ── Sync ─────────────────────────────────────────────────────────────────────
+// ── Upload ───────────────────────────────────────────────────────────────────
+let uploadFiles = [];
+let uploadTargets = null;
+
+async function openUpload() {
+  uploadFiles = [];
+  document.getElementById('upload-input').value = '';
+  document.getElementById('upload-status').innerHTML = '';
+  document.getElementById('drop-zone-text').textContent = 'Drop files here or click to choose';
+  document.getElementById('upload-modal').classList.add('show');
+  try {
+    uploadTargets = await (await fetch('/api/upload_targets')).json();
+  } catch (e) { uploadTargets = null; }
+  const stk = uploadTargets && uploadTargets.stk_available;
+  const usb = uploadTargets && uploadTargets.device_connected;
+  const stkInput = document.querySelector('input[name="upload-method"][value="stk"]');
+  const usbInput = document.querySelector('input[name="upload-method"][value="usb"]');
+  stkInput.disabled = !stk;
+  usbInput.disabled = !usb;
+  stkInput.closest('label').classList.toggle('disabled', !stk);
+  usbInput.closest('label').classList.toggle('disabled', !usb);
+  if (!stk) document.getElementById('stk-hint').textContent =
+    'Send to Kindle for PC is not installed. Get it from amazon.com/sendtokindle.';
+  if (!usb) document.getElementById('usb-hint').textContent =
+    'Connect the Kindle by USB to use this option.';
+  if (!stk && usb) usbInput.checked = true;
+  if (stk && !usb) stkInput.checked = true;
+  refreshUploadButton();
+}
+
+function closeUpload() {
+  document.getElementById('upload-modal').classList.remove('show');
+}
+
+function uploadMethod() {
+  const el = document.querySelector('input[name="upload-method"]:checked');
+  return el && !el.disabled ? el.value : null;
+}
+
+function setUploadFiles(fileList) {
+  uploadFiles = Array.from(fileList || []);
+  const n = uploadFiles.length;
+  document.getElementById('drop-zone-text').textContent = n === 0
+    ? 'Drop files here or click to choose'
+    : (n === 1 ? uploadFiles[0].name : `${n} files: ` + uploadFiles.map(f => f.name).join(', '));
+  refreshUploadButton();
+}
+
+function refreshUploadButton() {
+  document.getElementById('upload-go').disabled = !(uploadFiles.length && uploadMethod());
+}
+
+async function doUpload() {
+  const method = uploadMethod();
+  if (!method || !uploadFiles.length) return;
+  const status = document.getElementById('upload-status');
+  const btn = document.getElementById('upload-go');
+  btn.disabled = true;
+  status.innerHTML = method === 'usb'
+    ? '<span class="info">Copying to the Kindle over USB…</span>'
+    : '<span class="info">Handing the files to Send to Kindle…</span>';
+  const form = new FormData();
+  form.append('method', method);
+  uploadFiles.forEach(f => form.append('files', f, f.name));
+  try {
+    const d = await (await fetch('/api/upload', { method: 'POST', body: form })).json();
+    let html = '';
+    (d.results || []).forEach(r => {
+      html += r.ok
+        ? `<span class="ok">✓ ${escHtml(r.file)}</span><br>`
+        : `<span class="err">✗ ${escHtml(r.file)}: ${escHtml(r.error || 'failed')}</span><br>`;
+    });
+    if (d.error) html += `<span class="err">✗ ${escHtml(d.error)}</span><br>`;
+    if (d.message) html += escHtml(d.message);
+    status.innerHTML = html;
+    if (d.ok) setUploadFiles([]);
+  } catch (e) {
+    status.innerHTML = `<span class="err">✗ Upload failed: ${escHtml(e.message)}</span>`;
+  }
+  refreshUploadButton();
+}
+
+(function initDropZone() {
+  const zone = document.getElementById('drop-zone');
+  ['dragenter', 'dragover'].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); zone.classList.add('dragover');
+  }));
+  ['dragleave', 'drop'].forEach(ev => zone.addEventListener(ev, e => {
+    e.preventDefault(); zone.classList.remove('dragover');
+  }));
+  zone.addEventListener('drop', e => setUploadFiles(e.dataTransfer.files));
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && document.getElementById('upload-modal').classList.contains('show')) closeUpload();
+  });
+})();
+
 async function syncAll() {
   const drawer = document.getElementById('sync-drawer');
   const log = document.getElementById('sync-log');
@@ -3255,7 +3567,11 @@ if __name__ == "__main__":
     parser.add_argument("--sync", action="store_true",
                         help="Sync from the device before serving")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--stk-handler",
+                        help="Path to Send to Kindle's StkSendToHandler.exe "
+                             "(found automatically when installed normally)")
     args = parser.parse_args()
+    _stk_override["path"] = args.stk_handler
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
